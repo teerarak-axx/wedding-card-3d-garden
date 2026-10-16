@@ -1,0 +1,45 @@
+import { chromium, expect } from '@playwright/test';
+import express from 'express';
+import { mkdtempSync,writeFileSync,rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join,resolve } from 'node:path';
+import { createApp } from '../server/index.js';
+import { makeWave } from './helpers/audio.js';
+const temp=mkdtempSync(join(tmpdir(),'garden-music-browser-'));
+const app=createApp({dbPath:join(temp,'test.sqlite'),uploadsPath:join(temp,'uploads'),adminPassword:'music-test-password'});
+app.use(express.static(resolve('dist')));app.get('/{*path}',(req,res)=>res.sendFile(resolve('dist/index.html')));
+const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
+const base=`http://127.0.0.1:${server.address().port}`;
+const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',headless:true,args:['--no-sandbox','--enable-unsafe-swiftshader','--use-angle=swiftshader']});
+const context=await browser.newContext({viewport:{width:1440,height:1000},reducedMotion:'reduce'});
+const errors=[];
+try{
+  const admin=await context.newPage();admin.on('pageerror',e=>errors.push(e.message));await admin.goto(base+'/admin');
+  await admin.getByLabel('รหัสผ่าน',{exact:true}).fill('music-test-password');await admin.getByRole('button',{name:'เข้าสู่ระบบ',exact:true}).click();
+  await expect(admin.locator('.admin-stats')).toBeVisible();await admin.getByRole('button',{name:'เพลงประกอบ',exact:true}).click();
+  const fixture=join(temp,'Our little song.wav');writeFileSync(fixture,makeWave(2));
+  await admin.getByLabel('ไฟล์เพลง',{exact:true}).setInputFiles(fixture);
+  await expect(admin.getByLabel('ชื่อเพลงที่แสดง',{exact:true})).toHaveValue('Our little song');
+  const preview=admin.getByLabel('ทดลองฟังเพลง',{exact:true});await expect(preview).toBeVisible();
+  await admin.waitForFunction(()=>document.querySelector('.music-preview audio')?.readyState>=2);
+  await admin.getByLabel('ระดับเสียงเริ่มต้น',{exact:true}).fill('42');
+  await admin.getByRole('button',{name:'บันทึกการเปลี่ยนแปลง',exact:true}).click();await expect(admin.getByRole('status')).toContainText('บันทึกแล้ว');
+  const settings=await(await admin.request.get(base+'/api/config')).json();expect(settings.musicEnabled).toBe(true);expect(settings.musicVolume).toBe(.42);expect(settings.musicUrl).toMatch(/\.wav$/);
+  await admin.screenshot({path:'/tmp/garden-admin-music.png'});console.log('PASS Admin upload, preview, volume and durable settings');
+  const guest=await context.newPage();guest.on('pageerror',e=>errors.push(e.message));
+  await guest.addInitScript(()=>{const RealAudio=window.Audio;window.Audio=function(...args){const audio=new RealAudio(...args);window.testWeddingAudio=audio;return audio;};window.Audio.prototype=RealAudio.prototype;});
+  await guest.goto(base);await guest.locator('.chapter-panel.is-active').waitFor({timeout:60000});
+  await guest.waitForFunction(()=>window.testWeddingAudio?.readyState>=2);
+  await guest.getByRole('button',{name:'เปิดเพลงประกอบ',exact:true}).click();
+  await expect(guest.getByRole('button',{name:'หยุดเพลงประกอบ',exact:true})).toHaveAttribute('aria-pressed','true');
+  expect(await guest.evaluate(()=>window.testWeddingAudio.paused)).toBe(false);expect(await guest.evaluate(()=>window.testWeddingAudio.volume)).toBe(.42);
+  await guest.waitForTimeout(2300);expect(await guest.evaluate(()=>window.testWeddingAudio.currentTime)).toBeGreaterThan(0);
+  await guest.setViewportSize({width:320,height:640});expect(await guest.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await guest.getByRole('button',{name:'หยุดเพลงประกอบ',exact:true}).click();expect(await guest.evaluate(()=>window.testWeddingAudio.paused)).toBe(true);
+  await guest.screenshot({path:'/tmp/garden-music-mobile.png'});console.log('PASS public song playback, looping and mobile play/pause');
+  await admin.setViewportSize({width:390,height:844});expect(await admin.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await admin.screenshot({path:'/tmp/garden-admin-music-mobile.png'});
+  await admin.getByRole('button',{name:'นำเพลงออกจากการ์ด',exact:true}).click();await admin.getByRole('button',{name:'บันทึกการเปลี่ยนแปลง',exact:true}).click();await expect(admin.getByRole('status')).toContainText('บันทึกแล้ว');
+  expect((await(await admin.request.get(base+'/api/config')).json()).musicEnabled).toBe(false);expect(errors).toEqual([]);console.log('PASS remove song and no JavaScript errors; all test data isolated');
+}finally{
+  await browser.close();await new Promise(r=>server.close(r));app.locals.db.close();rmSync(temp,{recursive:true,force:true});
+}

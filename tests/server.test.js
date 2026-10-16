@@ -1,0 +1,45 @@
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createApp } from '../server/index.js';
+import { makeWave } from './helpers/audio.js';
+let app,server,base,cookie,temp;
+const request=async(path,method='GET',data,authenticated=false)=>{const res=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(authenticated?{Cookie:cookie}:{})},...(data?{body:JSON.stringify(data)}:{})});return res;};
+before(async()=>{temp=mkdtempSync(join(tmpdir(),'garden-tests-'));app=createApp({dbPath:join(temp,'test.sqlite'),uploadsPath:join(temp,'uploads'),adminPassword:'test-password-1234'});server=app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));base=`http://127.0.0.1:${server.address().port}`;});
+after(async()=>{await new Promise(resolve=>server.close(resolve));app.locals.db.close();rmSync(temp,{recursive:true,force:true});});
+test('public invitation returns config but guest data requires authentication',async()=>{assert.equal((await request('/api/config')).status,200);assert.equal((await request('/api/admin/guests')).status,401);assert.equal((await request('/api/admin/config','PUT',{})).status,401);});
+test('RSVP validates attendance and group size',async()=>{for(const count of [0,11,1.5])assert.equal((await request('/api/rsvp','POST',{name:'Test Guest',contact:'',attendance:'yes',count,dietary:'',message:''})).status,400);assert.equal((await request('/api/rsvp','POST',{name:'',contact:'',attendance:'yes',count:1,dietary:'',message:''})).status,400);});
+test('RSVP accepts the simplified form without dietary information',async()=>{const response=await request('/api/rsvp','POST',{name:'Simplified guest',contact:'',attendance:'yes',count:2,message:''});assert.equal(response.status,201);const {id}=await response.json();const saved=app.locals.db.prepare('SELECT count,dietary FROM guests WHERE id=?').get(id);assert.equal(saved.count,2);assert.equal(saved.dietary,'');app.locals.db.prepare('DELETE FROM guests WHERE id=?').run(id);});
+test('admin login sets HttpOnly session and rejects incorrect password',async()=>{assert.equal((await request('/api/admin/login','POST',{username:'admin',password:'wrong'})).status,401);const res=await request('/api/admin/login','POST',{username:'admin',password:'test-password-1234'});assert.equal(res.status,200);assert.match(res.headers.get('set-cookie'),/HttpOnly/);cookie=res.headers.get('set-cookie').split(';')[0];assert.equal((await request('/api/admin/session','GET',null,true)).status,200);});
+test('RSVP is durable, visible to admin, exported safely, and removable',async()=>{let res=await request('/api/rsvp','POST',{name:'=Test Guest',contact:'test@example.com',attendance:'yes',count:3,dietary:'vegetarian',message:'Congratulations!'});assert.equal(res.status,201);const {id}=await res.json();const rows=await(await request('/api/admin/guests','GET',null,true)).json();assert.equal(rows[0].count,3);assert.equal(rows[0].id,id);assert.equal(app.locals.db.prepare('SELECT count FROM guests WHERE id=?').get(id).count,3);const csv=await(await request('/api/admin/export','GET',null,true)).text();assert.ok(csv.includes("'=Test Guest"));assert.ok(csv.split('\r\n')[0].includes('คำอวยพร'));assert.ok(!csv.split('\r\n')[0].includes('อาหาร'));assert.equal((await request('/api/admin/guests/'+id,'DELETE',null,true)).status,200);assert.equal((await request('/api/admin/guests/'+id,'DELETE',null,true)).status,404);});
+test('declined RSVP always records zero guests',async()=>{const res=await request('/api/rsvp','POST',{name:'Absent guest',contact:'',attendance:'no',count:2,dietary:'',message:''});assert.equal(res.status,201);const {id}=await res.json();assert.equal(app.locals.db.prepare('SELECT count FROM guests WHERE id=?').get(id).count,0);});
+test('config rejects unsafe URLs and invalid schedule; updates persist',async()=>{const c=await(await request('/api/config')).json();assert.equal((await request('/api/admin/config','PUT',{...c,mapsUrl:'javascript:alert(1)'},true)).status,400);assert.equal((await request('/api/admin/config','PUT',{...c,schedule:[{time:'25:99',title:'x',detail:''}]},true)).status,400);let res=await request('/api/admin/config','PUT',{...c,groom:'Updated',isDemo:false},true);assert.equal(res.status,200);assert.equal((await(await request('/api/config')).json()).groom,'Updated');});
+test('closed RSVP rejects new submissions',async()=>{const c=await(await request('/api/config')).json();await request('/api/admin/config','PUT',{...c,rsvpDeadline:'2020-01-01'},true);assert.equal((await request('/api/rsvp','POST',{name:'Late guest',contact:'',attendance:'yes',count:1,dietary:'',message:''})).status,400);});
+test('cross-origin mutation is blocked',async()=>{const res=await fetch(base+'/api/admin/logout',{method:'POST',headers:{Origin:'https://another.example',Cookie:cookie}});assert.equal(res.status,403);});
+test('image upload validates actual file bytes',async()=>{assert.equal((await request('/api/admin/upload','POST',{data:'data:image/png;base64,YWJjZA=='},true)).status,400);const data='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1sAAAAASUVORK5CYII=';const res=await request('/api/admin/upload','POST',{data},true);assert.equal(res.status,201);const {url}=await res.json();assert.equal((await request(url)).status,200);});
+test('old invitations gain music defaults while retaining their saved details',async()=>{
+ const original=app.locals.db.prepare('SELECT value FROM settings WHERE id=1').get().value;
+ const legacy=JSON.parse(original);for(const key of ['musicUrl','musicTitle','musicEnabled','musicVolume'])delete legacy[key];legacy.bride='Existing bride';
+ app.locals.db.prepare('UPDATE settings SET value=? WHERE id=1').run(JSON.stringify(legacy));
+ try{const c=await(await request('/api/config')).json();assert.equal(c.bride,'Existing bride');assert.equal(c.musicUrl,'');assert.equal(c.musicEnabled,false);assert.equal(c.musicVolume,.35);}finally{app.locals.db.prepare('UPDATE settings SET value=? WHERE id=1').run(original);}
+});
+test('music upload is protected, verifies the file, and supports audio range requests',async()=>{
+ const bytes=makeWave();
+ assert.equal((await fetch(base+'/api/admin/music',{method:'POST',headers:{'Content-Type':'audio/wav'},body:bytes})).status,401);
+ assert.equal((await fetch(base+'/api/admin/music',{method:'POST',headers:{'Content-Type':'audio/mpeg',Cookie:cookie},body:Buffer.alloc(80,65)})).status,400);
+ const uploaded=await fetch(base+'/api/admin/music',{method:'POST',headers:{'Content-Type':'audio/wav',Cookie:cookie},body:bytes});assert.equal(uploaded.status,201);const {url}=await uploaded.json();assert.match(url,/^\/uploads\/.*\.wav$/);
+ const range=await fetch(base+url,{headers:{Range:'bytes=0-43'}});assert.equal(range.status,206);assert.equal((await range.arrayBuffer()).byteLength,44);assert.match(range.headers.get('content-type'),/audio\//);
+ const c=await(await request('/api/config')).json();const saved=await request('/api/admin/config','PUT',{...c,musicUrl:url,musicTitle:'Our song',musicEnabled:true,musicVolume:.42},true);assert.equal(saved.status,200);
+ const publicConfig=await(await request('/api/config')).json();assert.equal(publicConfig.musicUrl,url);assert.equal(publicConfig.musicEnabled,true);assert.equal(publicConfig.musicVolume,.42);assert.equal(JSON.parse(app.locals.db.prepare('SELECT value FROM settings WHERE id=1').get().value).musicTitle,'Our song');
+});
+test('music rejects invalid settings and preserves the track when an older admin saves',async()=>{
+ const c=await(await request('/api/config')).json();
+ for(const change of [{musicUrl:'javascript:alert(1)'},{musicVolume:1.1},{musicUrl:'',musicEnabled:true}])assert.equal((await request('/api/admin/config','PUT',{...c,...change},true)).status,400);
+ const older={...c};for(const key of ['musicUrl','musicTitle','musicEnabled','musicVolume'])delete older[key];assert.equal((await request('/api/admin/config','PUT',older,true)).status,200);assert.equal((await(await request('/api/config')).json()).musicUrl,c.musicUrl);
+});
+test('music upload enforces the 20 MB limit',async()=>{
+ const response=await fetch(base+'/api/admin/music',{method:'POST',headers:{'Content-Type':'audio/wav',Cookie:cookie},body:Buffer.alloc(20*1024*1024+1)});assert.equal(response.status,413);
+});
+test('password change invalidates active sessions',async()=>{const res=await request('/api/admin/password','PUT',{currentPassword:'test-password-1234',password:'changed-password-1234'},true);assert.equal(res.status,200);assert.equal((await request('/api/admin/session','GET',null,true)).status,401);assert.equal((await request('/api/admin/login','POST',{username:'admin',password:'test-password-1234'})).status,401);assert.equal((await request('/api/admin/login','POST',{username:'admin',password:'changed-password-1234'})).status,200);});

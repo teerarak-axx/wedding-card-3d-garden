@@ -1,0 +1,31 @@
+import { chromium, expect } from '@playwright/test';
+const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'/usr/bin/google-chrome',headless:true,args:['--no-sandbox','--enable-unsafe-swiftshader','--use-angle=swiftshader']});
+const base=process.env.TEST_URL||'http://localhost:4173';
+const page=await browser.newPage({viewport:{width:1440,height:1000},deviceScaleFactor:1});
+const errors=[];page.on('pageerror',e=>{errors.push(e.message);console.log('ERROR:',e.message);});page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
+await page.goto(base,{waitUntil:'networkidle'});
+await page.locator('.chapter-panel.is-active').waitFor({state:'visible',timeout:60000});
+await page.locator('canvas').waitFor({state:'visible',timeout:60000});
+await page.locator('.scene-loading').waitFor({state:'detached',timeout:60000});
+await page.waitForTimeout(2000);
+await page.screenshot({path:'/tmp/garden-desktop.png',fullPage:false});
+console.log('title:',await page.title(),'canvas:',await page.locator('canvas').count());
+for(const index of [1,2,3,4]){await page.getByRole('navigation',{name:'เส้นทางในสวน'}).getByRole('button').nth(index).click();await expect(page.locator('.chapter-'+index)).toBeVisible();await expect(page.locator('.chapter-'+index)).toHaveCSS('opacity','1');await page.waitForTimeout(2400);await page.screenshot({path:`/tmp/garden-desktop-${index}.png`});console.log('chapter',index,await page.locator('.chapter-panel.is-active').innerText());}
+await page.getByRole('button',{name:'ยืนยันการมาร่วมงาน',exact:true}).click();
+await expect(page.locator('.rsvp-modal')).toBeVisible();
+await expect(page.locator('.modal-backdrop')).toHaveCSS('opacity','1');
+await page.screenshot({path:'/tmp/garden-rsvp.png'});
+await page.getByRole('button',{name:'ปิด',exact:true}).click();
+await page.setViewportSize({width:390,height:844});
+await page.getByRole('button',{name:'กลับสู่หน้าประตูสวน'}).click();await expect(page.locator('.chapter-0')).toBeVisible();await expect(page.locator('.chapter-0')).toHaveCSS('opacity','1');await page.waitForTimeout(2400);await page.screenshot({path:'/tmp/garden-mobile.png'});
+for(const index of [1,3,4]){await page.getByRole('navigation',{name:'เส้นทางในสวน'}).getByRole('button').nth(index).click();await expect(page.locator('.chapter-'+index)).toBeVisible();await expect(page.locator('.chapter-'+index)).toHaveCSS('opacity','1');await page.waitForTimeout(2400);await page.screenshot({path:`/tmp/garden-mobile-${index}.png`});}
+console.log('horizontal overflow:',await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth));
+await page.goto(base+'/admin',{waitUntil:'networkidle'});await page.screenshot({path:'/tmp/garden-admin-login.png'});
+await page.setViewportSize({width:1440,height:1000});
+const {readFileSync}=await import('node:fs');const password=readFileSync('.env','utf8').match(/ADMIN_PASSWORD=(.*)/)[1];
+await page.getByLabel('รหัสผ่าน',{exact:true}).fill(password);await page.getByRole('button',{name:'เข้าสู่ระบบ',exact:true}).click();await expect(page.locator('.admin-stats')).toBeVisible();await page.waitForTimeout(1000);await page.screenshot({path:'/tmp/garden-admin.png'});
+console.log('admin loaded:',await page.getByText('Your garden, at a glance.').count());
+const unexpected=errors.filter(e=>!e.includes('401 (Unauthorized)'));
+console.log('unexpected errors:',JSON.stringify(unexpected));
+expect(unexpected).toEqual([]);
+await browser.close();
